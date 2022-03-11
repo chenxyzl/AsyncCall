@@ -14,20 +14,20 @@ import (
 )
 
 const (
-	SleepTime    = time.Duration(100)
-	AsyncTimeOut = time.Duration(1000)
-	MailBoxSize  = 10
-	ActorSize    = 100000
-	MessageCount = 10
+	SleepTime        = time.Duration(100)
+	AsyncTimeOut     = time.Duration(1000)
+	MailBoxSize      = 10
+	ActorCount       = 100000 //同时运行多少个actor
+	ActorPerMsgCount = 10  //每个actor多少条消息
 )
 
-//最大Rpc协程数-1台机器通常可以轻松运行一百万个协程，这里设置保守设置来
-const MaxGoCount = 1024 * 100
+//最大Rpc协程数[包含挂起]-1台机器通常可以轻松运行一百万个协程，这里设置保守设置来,[虽然go的实际并发为runtime.GOMAXPROCS()]
+const MaxGoCount = 1024 * 10
 
 //运行中的的Rpc协程数
 var RunningGoNum int32 = 0
 
-const totalMessageCount int32 = ActorSize * MessageCount
+const totalMessageCount int32 = ActorCount * ActorPerMsgCount
 
 var currentMessageCount int32 = 0
 
@@ -153,9 +153,9 @@ func waiting() {
 }
 
 func main() {
-	for m := 0; m <= ActorSize; m++ {
+	for m := 0; m <= ActorCount; m++ {
 		actor := NewActor()
-		for i := 0; i < MessageCount; i++ {
+		for i := 0; i < ActorPerMsgCount; i++ {
 			go func(j int) {
 				actor.Boxs <- j
 			}(i)
