@@ -11,6 +11,11 @@ import (
 	"time"
 )
 
+const (
+	SleepTime = time.Duration(3000)
+	TimeOut = time.Duration(300)
+)
+
 type Message struct {
 	sn   int
 	body []byte
@@ -76,7 +81,7 @@ func (actor *Actor) DoSomethings(a int) {
 	actor.v++
 	println(fmt.Sprintf("---  v:%d a:%d time:%d", actor.v, a, time.Now().Second()))
 	actor.asyncCall(func() {
-		time.Sleep(time.Millisecond * 3000)
+		time.Sleep(time.Millisecond * SleepTime)
 	})
 	actor.v++
 	println(fmt.Sprintf("+++  v:%d a:%d time:%d", actor.v, a, time.Now().Second()))
@@ -91,7 +96,7 @@ func (actor *Actor) asyncCall(f func()) {
 
 	c := make(chan bool)
 
-	timeoutTimer := time.After(time.Millisecond * 30000)
+	timeoutTimer := time.After(time.Millisecond * TimeOut)
 	go func() {
 		f()
 		c <- true
