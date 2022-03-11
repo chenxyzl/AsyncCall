@@ -1,48 +1,73 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"golang.org/x/sync/semaphore"
 	"os"
 	"os/signal"
-	"runtime"
 	"sync"
 	"syscall"
 	"time"
 )
 
-var maxGoNum = 10
-var activeGoNum = 0
+type Message struct {
+	sn   int
+	body []byte
+}
+
+func NewMessage(i int, b []byte) *Message {
+	return &Message{sn: i, body: b}
+}
 
 type Actor struct {
-	lock sync.RWMutex
-	Boxs chan int
-	v    int
+	lock      *semaphore.Weighted
+	cond      *sync.Cond
+	condition bool
+	Boxs      chan int
+	v         int
+	il        int32
+}
+
+func NewActor() *Actor {
+	var lock sync.Mutex
+	actor := &Actor{
+		Boxs: make(chan int, 10),
+		lock: semaphore.NewWeighted(int64(1)),
+		cond: sync.NewCond(&lock),
+		v:    0}
+	return actor
+}
+
+func (actor *Actor) Lock(i int) {
+	//lockNum := atomic.AddInt32(&actor.il, 1)
+	//println(fmt.Sprintf("lockNum:%d i:%d lock", lockNum, i))
+	ctx := context.Background()
+	actor.lock.Acquire(ctx, 1)
+}
+
+func (actor *Actor) Unlock(i int) {
+	//lockNum := atomic.AddInt32(&actor.il, -1)
+	//println(fmt.Sprintf("lockNum:%d i:%d unlock", lockNum, i))
+	actor.condition = true
+	actor.lock.Release(1)
 }
 
 func (actor *Actor) Run() {
 	go func() {
-		for {
-			select {
-			case a := <-actor.Boxs:
-				{
-					actor.Recv(a)
-				}
-			}
+		for a := range actor.Boxs {
+			actor.Recv(a)
 		}
 	}()
 }
 
 func (actor *Actor) Recv(a int) {
-	actor.lock.Lock()
-	for activeGoNum >= maxGoNum {
-		runtime.Gosched()
-	}
-	activeGoNum++
+	actor.Lock(a)
 	go func() {
 		defer func() {
-			activeGoNum--
-			actor.lock.Unlock()
+			actor.Unlock(a)
 		}()
+
 		actor.DoSomethings(a)
 	}()
 }
@@ -51,52 +76,48 @@ func (actor *Actor) DoSomethings(a int) {
 	actor.v++
 	println(fmt.Sprintf("---  v:%d a:%d time:%d", actor.v, a, time.Now().Second()))
 	actor.asyncCall(func() {
-		time.Sleep(time.Duration(3) * time.Second)
+		time.Sleep(time.Millisecond * 3000)
 	})
+	actor.v++
 	println(fmt.Sprintf("+++  v:%d a:%d time:%d", actor.v, a, time.Now().Second()))
 }
 
 func (actor *Actor) asyncCall(f func()) {
-	actor.lock.Unlock()
+	actor.Unlock(99)
+	defer func() {
+		actor.Lock(999)
+		println(fmt.Sprintf("==== asynccall unlock:%v", true))
+	}()
+
 	c := make(chan bool)
+
+	timeoutTimer := time.After(time.Millisecond * 30000)
 	go func() {
 		f()
 		c <- true
 	}()
 	select {
-	case i := <-c:
-		{
-			println(fmt.Sprintf("==== asynccall recv:%d", i))
-			break
-		}
+	case <-timeoutTimer:
+		return
+	case <-c:
+		return
 	}
-	actor.lock.Lock()
 }
 
 func waiting() {
 	sigs := make(chan os.Signal)
 	signal.Notify(sigs, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	fmt.Println("awaiting signal")
 	for {
 		select {
 		case _ = <-sigs:
-			break
+			return
 		}
 	}
 	fmt.Println("exiting")
 }
 
 func main() {
-	fmt.Println("1")
-	a := make(chan bool)
-	go func() {
-		time.Sleep(2 * time.Second)
-		a <- true
-	}()
-	b := <-a
-	fmt.Println("2")
-	println(b)
-	actor := &Actor{Boxs: make(chan int, 10), v: 0}
+	actor := NewActor()
 	for i := 0; i <= 10; i++ {
 		go func(j int) {
 			actor.Boxs <- j
