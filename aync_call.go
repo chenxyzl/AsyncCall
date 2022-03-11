@@ -6,15 +6,30 @@ import (
 	"golang.org/x/sync/semaphore"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 const (
-	SleepTime = time.Duration(3000)
-	TimeOut = time.Duration(300)
+	SleepTime    = time.Duration(100)
+	AsyncTimeOut = time.Duration(1000)
+	MailBoxSize  = 10
+	ActorSize    = 100000
+	MessageCount = 10
 )
+
+//最大Rpc协程数-1台机器通常可以轻松运行一百万个协程，这里设置保守设置来
+const MaxGoCount = 1024 * 100
+
+//运行中的的Rpc协程数
+var RunningGoNum int32 = 0
+
+const totalMessageCount int32 = ActorSize * MessageCount
+
+var currentMessageCount int32 = 0
 
 type Message struct {
 	sn   int
@@ -26,18 +41,19 @@ func NewMessage(i int, b []byte) *Message {
 }
 
 type Actor struct {
-	lock      *semaphore.Weighted
-	cond      *sync.Cond
-	condition bool
-	Boxs      chan int
-	v         int
-	il        int32
+	lock         *semaphore.Weighted
+	cond         *sync.Cond
+	condition    bool
+	Boxs         chan int
+	v            int
+	il           int32
+	clientLastSn int32 //(客户端消息的sn，需要排序挨个处理)
 }
 
 func NewActor() *Actor {
 	var lock sync.Mutex
 	actor := &Actor{
-		Boxs: make(chan int, 10),
+		Boxs: make(chan int, MailBoxSize),
 		lock: semaphore.NewWeighted(int64(1)),
 		cond: sync.NewCond(&lock),
 		v:    0}
@@ -45,15 +61,11 @@ func NewActor() *Actor {
 }
 
 func (actor *Actor) Lock(i int) {
-	//lockNum := atomic.AddInt32(&actor.il, 1)
-	//println(fmt.Sprintf("lockNum:%d i:%d lock", lockNum, i))
 	ctx := context.Background()
 	actor.lock.Acquire(ctx, 1)
 }
 
 func (actor *Actor) Unlock(i int) {
-	//lockNum := atomic.AddInt32(&actor.il, -1)
-	//println(fmt.Sprintf("lockNum:%d i:%d unlock", lockNum, i))
 	actor.condition = true
 	actor.lock.Release(1)
 }
@@ -61,15 +73,29 @@ func (actor *Actor) Unlock(i int) {
 func (actor *Actor) Run() {
 	go func() {
 		for a := range actor.Boxs {
+			//todo 区分客户端消息和内部rpc
 			actor.Recv(a)
 		}
 	}()
 }
 
+var goNumLock sync.Mutex
+
 func (actor *Actor) Recv(a int) {
+	goNumLock.Lock()
+	for {
+		if RunningGoNum >= MaxGoCount {
+			runtime.Gosched()
+		} else {
+			break
+		}
+	}
+	goNumLock.Unlock()
 	actor.Lock(a)
+	atomic.AddInt32(&RunningGoNum, 1)
 	go func() {
 		defer func() {
+			atomic.AddInt32(&RunningGoNum, -1)
 			actor.Unlock(a)
 		}()
 
@@ -79,24 +105,29 @@ func (actor *Actor) Recv(a int) {
 
 func (actor *Actor) DoSomethings(a int) {
 	actor.v++
-	println(fmt.Sprintf("---  v:%d a:%d time:%d", actor.v, a, time.Now().Second()))
+	//fmt.Printf("---  v:%d a:%d time:%d\n", actor.v, a, time.Now().Second())
 	actor.asyncCall(func() {
 		time.Sleep(time.Millisecond * SleepTime)
 	})
 	actor.v++
-	println(fmt.Sprintf("+++  v:%d a:%d time:%d", actor.v, a, time.Now().Second()))
+
+	atomic.AddInt32(&currentMessageCount, 1)
+	//fmt.Printf("+++  v:%d a:%d time:%d\n", actor.v, a, time.Now().Second())
+	if currentMessageCount == totalMessageCount {
+		fmt.Println("do message size end:", currentMessageCount)
+	}
 }
 
 func (actor *Actor) asyncCall(f func()) {
 	actor.Unlock(99)
 	defer func() {
 		actor.Lock(999)
-		println(fmt.Sprintf("==== asynccall unlock:%v", true))
+		//fmt.Printf("==== asynccall unlock:%v\n", true)
 	}()
 
 	c := make(chan bool)
 
-	timeoutTimer := time.After(time.Millisecond * TimeOut)
+	timeoutTimer := time.After(time.Millisecond * AsyncTimeOut)
 	go func() {
 		f()
 		c <- true
@@ -122,12 +153,14 @@ func waiting() {
 }
 
 func main() {
-	actor := NewActor()
-	for i := 0; i <= 10; i++ {
-		go func(j int) {
-			actor.Boxs <- j
-		}(i)
+	for m := 0; m <= ActorSize; m++ {
+		actor := NewActor()
+		for i := 0; i < MessageCount; i++ {
+			go func(j int) {
+				actor.Boxs <- j
+			}(i)
+		}
+		actor.Run()
 	}
-	actor.Run()
 	waiting()
 }
