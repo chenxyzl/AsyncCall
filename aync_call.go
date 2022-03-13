@@ -14,18 +14,13 @@ import (
 )
 
 const (
-	SleepTime        = time.Duration(100)
-	AsyncTimeOut     = time.Duration(1000)
-	MailBoxSize      = 10
-	ActorCount       = 100000 //同时运行多少个actor
-	ActorPerMsgCount = 10  //每个actor多少条消息
+	SleepTime             = time.Duration(100) * time.Millisecond
+	AsyncTimeOut          = time.Duration(1000) * time.Millisecond
+	MailBoxSize           = 10
+	ActorCount            = 100000 //同时运行多少个actor
+	ActorPerMsgCount      = 10     //每个actor多少条消息
+	ActorMaxRunningGoSize = 10     //单个actor内最多同时处理消息的go程的数量
 )
-
-//最大Rpc协程数[包含挂起]-1台机器通常可以轻松运行一百万个协程，这里设置保守设置来,[虽然go的实际并发为runtime.GOMAXPROCS()]
-const MaxGoCount = 1024 * 10
-
-//运行中的的Rpc协程数
-var RunningGoNum int32 = 0
 
 const totalMessageCount int32 = ActorCount * ActorPerMsgCount
 
@@ -41,62 +36,71 @@ func NewMessage(i int, b []byte) *Message {
 }
 
 type Actor struct {
-	lock         *semaphore.Weighted
-	cond         *sync.Cond
-	condition    bool
-	Boxs         chan int
-	v            int
-	il           int32
-	clientLastSn int32 //(客户端消息的sn，需要排序挨个处理)
+	lock             *semaphore.Weighted
+	goNumLock        sync.Mutex
+	cond             *sync.Cond
+	condition        bool
+	Boxs             chan int
+	v                int
+	il               int32
+	clientLastSn     int32 //(客户端消息的sn，需要排序挨个处理)
+	maxRunningGoSize int32 //让box的size等于同时运行的go的数量的大小。go程再多也没有啥意义了 size等于1就等同于单线程了
+	runningGoNum     int32 //最大值必须小于等于Boxs的缓存大小
 }
 
-func NewActor() *Actor {
-	var lock sync.Mutex
+func NewActor(boxSize int32, maxRunningGoSize int32) *Actor {
+	if boxSize <= 0 {
+		panic("boxSize must bigger than 0")
+	}
 	actor := &Actor{
-		Boxs: make(chan int, MailBoxSize),
-		lock: semaphore.NewWeighted(int64(1)),
-		cond: sync.NewCond(&lock),
-		v:    0}
+		Boxs:             make(chan int, boxSize),
+		maxRunningGoSize: maxRunningGoSize,
+		lock:             semaphore.NewWeighted(int64(1)),
+		v:                0}
 	return actor
 }
 
 func (actor *Actor) Lock(i int) {
 	ctx := context.Background()
 	actor.lock.Acquire(ctx, 1)
+	//fmt.Printf("lock  v:%d a:%d time:%d\n", actor.v, i, time.Now().Second())
 }
 
 func (actor *Actor) Unlock(i int) {
 	actor.condition = true
+	//fmt.Printf("unlock  v:%d a:%d time:%d\n", actor.v, i, time.Now().Second())
 	actor.lock.Release(1)
 }
 
 func (actor *Actor) Run() {
 	go func() {
 		for a := range actor.Boxs {
+			_ = a
 			//todo 区分客户端消息和内部rpc
 			actor.Recv(a)
 		}
 	}()
 }
 
-var goNumLock sync.Mutex
-
 func (actor *Actor) Recv(a int) {
-	goNumLock.Lock()
+	actor.goNumLock.Lock()
 	for {
-		if RunningGoNum >= MaxGoCount {
+		if actor.runningGoNum >= actor.maxRunningGoSize {
 			runtime.Gosched()
 		} else {
 			break
 		}
 	}
-	goNumLock.Unlock()
+	actor.goNumLock.Unlock()
 	actor.Lock(a)
-	atomic.AddInt32(&RunningGoNum, 1)
+	atomic.AddInt32(&actor.runningGoNum, 1)
 	go func() {
 		defer func() {
-			atomic.AddInt32(&RunningGoNum, -1)
+			atomic.AddInt32(&actor.runningGoNum, -1)
 			actor.Unlock(a)
+			if currentMessageCount == totalMessageCount {
+				fmt.Println("all message complete, count:", currentMessageCount)
+			}
 		}()
 
 		actor.DoSomethings(a)
@@ -106,30 +110,27 @@ func (actor *Actor) Recv(a int) {
 func (actor *Actor) DoSomethings(a int) {
 	actor.v++
 	//fmt.Printf("---  v:%d a:%d time:%d\n", actor.v, a, time.Now().Second())
-	actor.asyncCall(func() {
-		time.Sleep(time.Millisecond * SleepTime)
+	actor.asyncCall(a, func(int) {
+		time.Sleep(SleepTime)
 	})
 	actor.v++
 
 	atomic.AddInt32(&currentMessageCount, 1)
 	//fmt.Printf("+++  v:%d a:%d time:%d\n", actor.v, a, time.Now().Second())
-	if currentMessageCount == totalMessageCount {
-		fmt.Println("do message size end:", currentMessageCount)
-	}
 }
 
-func (actor *Actor) asyncCall(f func()) {
-	actor.Unlock(99)
-	defer func() {
-		actor.Lock(999)
+func (actor *Actor) asyncCall(i int, f func(int)) {
+	actor.Unlock(i)
+	defer func(a int) {
+		actor.Lock(a)
 		//fmt.Printf("==== asynccall unlock:%v\n", true)
-	}()
+	}(i)
 
 	c := make(chan bool)
 
-	timeoutTimer := time.After(time.Millisecond * AsyncTimeOut)
+	timeoutTimer := time.After(AsyncTimeOut)
 	go func() {
-		f()
+		f(i)
 		c <- true
 	}()
 	select {
@@ -153,14 +154,12 @@ func waiting() {
 }
 
 func main() {
-	for m := 0; m <= ActorCount; m++ {
-		actor := NewActor()
-		for i := 0; i < ActorPerMsgCount; i++ {
-			go func(j int) {
-				actor.Boxs <- j
-			}(i)
-		}
+	for m := 0; m < ActorCount; m++ {
+		actor := NewActor(MailBoxSize, ActorMaxRunningGoSize)
 		actor.Run()
+		for i := 0; i < ActorPerMsgCount; i++ {
+			actor.Boxs <- i
+		}
 	}
 	waiting()
 }
