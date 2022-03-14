@@ -44,8 +44,8 @@ type Actor struct {
 	v                int
 	il               int32
 	clientLastSn     int32 //(客户端消息的sn，需要排序挨个处理)
-	maxRunningGoSize int32 //让box的size等于同时运行的go的数量的大小。go程再多也没有啥意义了 size等于1就等同于单线程了
-	runningGoNum     int32 //最大值必须小于等于Boxs的缓存大小
+	maxRunningGoSize int32 //size等于1就等同于单线程了
+	runningGoNum     int32 //
 }
 
 func NewActor(boxSize int32, maxRunningGoSize int32) *Actor {
@@ -72,6 +72,14 @@ func (actor *Actor) Unlock(i int) {
 	actor.lock.Release(1)
 }
 
+func (actor *Actor) LockGoNum() {
+	actor.goNumLock.Lock()
+}
+
+func (actor *Actor) UnlockGoNum() {
+	actor.goNumLock.Unlock()
+}
+
 func (actor *Actor) Run() {
 	go func() {
 		for a := range actor.Boxs {
@@ -83,17 +91,18 @@ func (actor *Actor) Run() {
 }
 
 func (actor *Actor) Recv(a int) {
-	actor.goNumLock.Lock()
+	actor.LockGoNum()
 	for {
+		//如果已达到上线则切换到别的go程
 		if actor.runningGoNum >= actor.maxRunningGoSize {
 			runtime.Gosched()
 		} else {
+			atomic.AddInt32(&actor.runningGoNum, 1)
 			break
 		}
 	}
-	actor.goNumLock.Unlock()
+	actor.UnlockGoNum()
 	actor.Lock(a)
-	atomic.AddInt32(&actor.runningGoNum, 1)
 	go func() {
 		defer func() {
 			atomic.AddInt32(&actor.runningGoNum, -1)
